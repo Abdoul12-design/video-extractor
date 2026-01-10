@@ -59,15 +59,25 @@ def extract_video_info(url):
     """Extrait les informations vidéo d'une URL"""
     try:
         ydl_opts = {
-            'quiet': False,  # Changé pour voir les erreurs
-            'no_warnings': False,  # Changé pour voir les warnings
+            'quiet': False,
+            'no_warnings': False,
             'extract_flat': False,
             'force_generic_extractor': False,
             'socket_timeout': 30,
-            'format': 'best',  # Forcer le format "best"
-            'nocheckcertificate': True,  # Ignorer les erreurs SSL
+            'format': 'best',
+            'nocheckcertificate': True,
             'ignoreerrors': False,
             'no_color': True,
+            # Headers pour éviter le blocage anti-bot
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            },
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -109,6 +119,8 @@ def extract_video_info(url):
             raise Exception("Cette vidéo est protégée par des droits d'auteur")
         elif "Private video" in error_msg:
             raise Exception("Cette vidéo est privée")
+        elif "bot" in error_msg.lower() or "Sign in to confirm" in error_msg:
+            raise Exception("YouTube a détecté un accès automatisé. Réessayez dans quelques minutes ou utilisez une autre vidéo.")
         else:
             raise Exception(f"Impossible d'extraire cette vidéo: {error_msg}")
     except Exception as e:
