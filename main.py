@@ -59,20 +59,29 @@ def extract_video_info(url):
     """Extrait les informations vidéo d'une URL"""
     try:
         ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,  # Changé pour voir les erreurs
+            'no_warnings': False,  # Changé pour voir les warnings
             'extract_flat': False,
             'force_generic_extractor': False,
             'socket_timeout': 30,
+            'format': 'best',  # Forcer le format "best"
+            'nocheckcertificate': True,  # Ignorer les erreurs SSL
+            'ignoreerrors': False,
+            'no_color': True,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"Tentative d'extraction: {url}")
             info = ydl.extract_info(url, download=False)
+            
+            if not info:
+                raise Exception("Aucune information extraite")
             
             videos = []
             
             # Si c'est une playlist
             if 'entries' in info:
+                logger.info(f"Playlist détectée avec {len(info['entries'])} entrées")
                 for entry in info['entries']:
                     if entry:
                         video = format_video_info(entry)
@@ -80,17 +89,37 @@ def extract_video_info(url):
                             videos.append(video)
             else:
                 # Vidéo unique
+                logger.info(f"Vidéo unique détectée: {info.get('title', 'Sans titre')}")
                 video = format_video_info(info)
                 if video:
                     videos.append(video)
             
+            logger.info(f"Extraction réussie: {len(videos)} vidéo(s)")
             return videos
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Erreur de téléchargement yt-dlp: {str(e)}")
-        raise Exception("Impossible d'extraire cette vidéo. Vérifiez l'URL.")
+        error_msg = str(e)
+        logger.error(f"Erreur yt-dlp DownloadError: {error_msg}")
+        
+        # Messages d'erreur plus spécifiques
+        if "Video unavailable" in error_msg or "This video is unavailable" in error_msg:
+            raise Exception("Cette vidéo n'est pas disponible (privée ou supprimée)")
+        elif "age" in error_msg.lower() or "Sign in to confirm your age" in error_msg:
+            raise Exception("Cette vidéo est protégée par âge et ne peut pas être extraite")
+        elif "copyright" in error_msg.lower():
+            raise Exception("Cette vidéo est protégée par des droits d'auteur")
+        elif "Private video" in error_msg:
+            raise Exception("Cette vidéo est privée")
+        else:
+            raise Exception(f"Impossible d'extraire cette vidéo: {error_msg}")
     except Exception as e:
-        logger.error(f"Erreur extraction: {str(e)}")
-        raise Exception(f"Erreur lors de l'extraction: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Erreur extraction générale: {error_msg}")
+        
+        # Ne pas exposer les détails techniques au client
+        if "Aucune information extraite" in error_msg:
+            raise Exception("Impossible d'extraire cette vidéo. Vérifiez l'URL.")
+        else:
+            raise Exception(f"Erreur lors de l'extraction: {error_msg}")
 
 def format_video_info(info):
     """Formate les informations vidéo"""
@@ -101,38 +130,77 @@ def format_video_info(info):
         formats = []
         if 'formats' in info:
             for fmt in info['formats']:
-                # Filtrer uniquement les formats vidéo valides
-                if fmt.get('ext') in ['mp4', 'webm', '3gp', 'm4a']:
-                    filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
-                    
-                    # Vérifier la taille maximale
-                    if filesize > 0 and filesize > MAX_VIDEO_SIZE:
-                        continue
-                    
-                    format_info = {
-                        'quality': fmt.get('format_note', 'N/A'),
-                        'size': format_size(filesize),
-                        'codec': fmt.get('ext', 'N/A').upper(),
-                        'url': fmt.get('url', ''),
-                        'format_id': fmt.get('format_id', ''),
-                        'filesize': filesize
-                    }
-                    
-                    # Si pas de qualité spécifiée, utiliser la résolution
-                    if format_info['quality'] == 'N/A':
-                        format_info['quality'] = fmt.get('resolution', 'N/A')
-                    
-                    formats.append(format_info)
+                # Accepter les formats vidéo et audio
+                ext = fmt.get('ext', '')
+                vcodec = fmt.get('vcodec', 'none')
+                acodec = fmt.get('acodec', 'none')
+                
+                # Filtrer: doit avoir vidéo OU audio (pas "none")
+                if vcodec == 'none' and acodec == 'none':
+                    continue
+                
+                # Accepter plus d'extensions
+                if ext not in ['mp4', 'webm', '3gp', 'm4a', 'mkv']:
+                    continue
+                
+                filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
+                
+                # Vérifier la taille maximale (seulement si connue)
+                if filesize > MAX_VIDEO_SIZE:
+                    continue
+                
+                # Déterminer la qualité
+                quality = fmt.get('format_note', '')
+                if not quality or quality == 'N/A':
+                    # Essayer height (résolution verticale)
+                    height = fmt.get('height')
+                    if height:
+                        quality = f"{height}p"
+                    else:
+                        # Essayer resolution complète
+                        quality = fmt.get('resolution', 'unknown')
+                
+                format_info = {
+                    'quality': quality,
+                    'size': format_size(filesize) if filesize > 0 else 'Unknown',
+                    'codec': ext.upper(),
+                    'url': fmt.get('url', ''),
+                    'format_id': fmt.get('format_id', ''),
+                    'filesize': filesize
+                }
+                
+                formats.append(format_info)
         
-        # Filtrer et trier les formats
+        # Si aucun format trouvé, logger pour debug
+        if not formats:
+            logger.warning(f"Aucun format trouvé pour la vidéo {video_id}")
+            # Essayer d'obtenir le format "best" par défaut
+            if 'url' in info:
+                formats.append({
+                    'quality': 'best',
+                    'size': 'Unknown',
+                    'codec': info.get('ext', 'MP4').upper(),
+                    'url': info.get('url', ''),
+                    'format_id': 'best',
+                    'filesize': 0
+                })
+        
+        # Filtrer les doublons et trier
         unique_formats = {}
         for fmt in formats:
             key = f"{fmt['quality']}-{fmt['codec']}"
-            if key not in unique_formats or fmt['filesize'] > unique_formats[key]['filesize']:
+            # Garder celui avec la plus grande taille (ou le premier si taille inconnue)
+            if key not in unique_formats:
+                unique_formats[key] = fmt
+            elif fmt['filesize'] > 0 and (unique_formats[key]['filesize'] == 0 or fmt['filesize'] > unique_formats[key]['filesize']):
                 unique_formats[key] = fmt
         
-        # Limiter à 10 formats maximum
-        sorted_formats = sorted(unique_formats.values(), key=lambda x: x['filesize'], reverse=True)[:10]
+        # Limiter à 10 formats maximum et trier par taille
+        sorted_formats = sorted(
+            unique_formats.values(),
+            key=lambda x: x['filesize'] if x['filesize'] > 0 else 0,
+            reverse=True
+        )[:10]
         
         return {
             'id': video_id,
