@@ -293,6 +293,21 @@ def download_video():
         logger.error(f"Erreur API download: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/', methods=['GET'])
+def index():
+    """Page d'accueil de l'API"""
+    return jsonify({
+        'service': 'video-extractor-api',
+        'version': '2.0.0',
+        'status': 'running',
+        'endpoints': {
+            'health': '/api/health',
+            'extract': '/api/extract (POST)',
+            'download': '/api/download (POST)'
+        },
+        'documentation': 'https://github.com/votre-repo'
+    })
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Endpoint de vérification de santé de l'API"""
