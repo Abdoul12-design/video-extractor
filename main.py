@@ -4,10 +4,10 @@ import yt_dlp
 import os
 import tempfile
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import logging
-from functools import wraps
 import time
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -19,7 +19,102 @@ logger = logging.getLogger(__name__)
 # Configuration
 MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500 MB
 ALLOWED_DOMAINS = ['youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com']
-RATE_LIMIT = {}  # Simple rate limiting in memory
+RATE_LIMIT = {}
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')
+
+def extract_youtube_id(url):
+    """Extrait l'ID YouTube depuis une URL"""
+    try:
+        parsed = urlparse(url)
+        
+        # Format: youtube.com/watch?v=VIDEO_ID
+        if 'youtube.com' in parsed.netloc:
+            query_params = parse_qs(parsed.query)
+            if 'v' in query_params:
+                return query_params['v'][0]
+        
+        # Format: youtu.be/VIDEO_ID
+        if 'youtu.be' in parsed.netloc:
+            return parsed.path.lstrip('/')
+        
+        return None
+    except:
+        return None
+
+def get_video_info_from_youtube_api(video_id):
+    """Obtient les infos vidéo via l'API YouTube officielle"""
+    if not YOUTUBE_API_KEY:
+        logger.warning("Clé API YouTube non configurée")
+        return None
+    
+    try:
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            'part': 'snippet,contentDetails',
+            'id': video_id,
+            'key': YOUTUBE_API_KEY
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Erreur API YouTube: {response.status_code}")
+            return None
+        
+        data = response.json()
+        
+        if not data.get('items'):
+            logger.warning(f"Aucune vidéo trouvée pour ID: {video_id}")
+            return None
+        
+        item = data['items'][0]
+        snippet = item['snippet']
+        content_details = item['contentDetails']
+        
+        # Convertir la durée ISO 8601 en secondes
+        duration_str = content_details.get('duration', 'PT0S')
+        duration_seconds = parse_iso8601_duration(duration_str)
+        
+        # Obtenir la meilleure thumbnail
+        thumbnails = snippet.get('thumbnails', {})
+        thumbnail_url = (
+            thumbnails.get('maxres', {}).get('url') or
+            thumbnails.get('standard', {}).get('url') or
+            thumbnails.get('high', {}).get('url') or
+            thumbnails.get('medium', {}).get('url') or
+            thumbnails.get('default', {}).get('url') or
+            ''
+        )
+        
+        return {
+            'id': video_id,
+            'title': snippet.get('title', 'Sans titre'),
+            'thumbnail': thumbnail_url,
+            'duration': duration_seconds,
+            'from_api': True
+        }
+    
+    except Exception as e:
+        logger.error(f"Erreur lors de l'appel à l'API YouTube: {str(e)}")
+        return None
+
+def parse_iso8601_duration(duration_str):
+    """Convertit une durée ISO 8601 (ex: PT3M34S) en secondes"""
+    try:
+        import re
+        pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+        match = re.match(pattern, duration_str)
+        
+        if not match:
+            return 0
+        
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        
+        return hours * 3600 + minutes * 60 + seconds
+    except:
+        return 0
 
 def validate_url(url):
     """Valide l'URL de la vidéo"""
@@ -43,7 +138,6 @@ def rate_limit_check(ip_address):
     if ip_address not in RATE_LIMIT:
         RATE_LIMIT[ip_address] = []
     
-    # Nettoyer les anciennes requêtes (plus de 60 secondes)
     RATE_LIMIT[ip_address] = [
         req_time for req_time in RATE_LIMIT[ip_address]
         if current_time - req_time < 60
@@ -55,8 +149,114 @@ def rate_limit_check(ip_address):
     RATE_LIMIT[ip_address].append(current_time)
     return True
 
+def get_formats_from_ytdlp(url, video_info):
+    """Essaie d'obtenir les formats via yt-dlp"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'socket_timeout': 15,
+            'nocheckcertificate': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            },
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            if not info:
+                return []
+            
+            formats = []
+            if 'formats' in info:
+                for fmt in info['formats']:
+                    ext = fmt.get('ext', '')
+                    vcodec = fmt.get('vcodec', 'none')
+                    acodec = fmt.get('acodec', 'none')
+                    
+                    if vcodec == 'none' and acodec == 'none':
+                        continue
+                    
+                    if ext not in ['mp4', 'webm', '3gp', 'm4a', 'mkv']:
+                        continue
+                    
+                    filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
+                    
+                    if filesize > MAX_VIDEO_SIZE:
+                        continue
+                    
+                    height = fmt.get('height')
+                    quality = f"{height}p" if height else fmt.get('format_note', 'unknown')
+                    
+                    formats.append({
+                        'quality': quality,
+                        'size': format_size(filesize) if filesize > 0 else 'Unknown',
+                        'codec': ext.upper(),
+                        'url': fmt.get('url', ''),
+                        'format_id': fmt.get('format_id', ''),
+                        'filesize': filesize
+                    })
+            
+            # Dédupliquer et trier
+            unique_formats = {}
+            for fmt in formats:
+                key = f"{fmt['quality']}-{fmt['codec']}"
+                if key not in unique_formats:
+                    unique_formats[key] = fmt
+                elif fmt['filesize'] > 0 and (unique_formats[key]['filesize'] == 0 or fmt['filesize'] > unique_formats[key]['filesize']):
+                    unique_formats[key] = fmt
+            
+            return sorted(
+                unique_formats.values(),
+                key=lambda x: x['filesize'] if x['filesize'] > 0 else 0,
+                reverse=True
+            )[:10]
+    
+    except Exception as e:
+        logger.warning(f"yt-dlp a échoué pour les formats: {str(e)}")
+        return []
+
 def extract_video_info(url):
-    """Extrait les informations vidéo d'une URL"""
+    """Extrait les informations vidéo - Mode hybride API YouTube + yt-dlp"""
+    try:
+        # Vérifier si c'est une URL YouTube
+        video_id = extract_youtube_id(url)
+        
+        # Méthode 1: Essayer l'API YouTube d'abord (plus fiable)
+        if video_id and YOUTUBE_API_KEY:
+            logger.info(f"Utilisation de l'API YouTube pour: {video_id}")
+            video_info = get_video_info_from_youtube_api(video_id)
+            
+            if video_info:
+                # Essayer d'obtenir les formats avec yt-dlp
+                formats = get_formats_from_ytdlp(url, video_info)
+                
+                if not formats:
+                    # Si pas de formats, créer un format générique
+                    formats = [{
+                        'quality': 'best',
+                        'size': 'Unknown',
+                        'codec': 'MP4',
+                        'url': '',
+                        'format_id': 'best',
+                        'filesize': 0
+                    }]
+                
+                video_info['formats'] = formats
+                return [video_info]
+        
+        # Méthode 2: Fallback sur yt-dlp pur (pour non-YouTube ou si API échoue)
+        logger.info(f"Utilisation de yt-dlp pour: {url}")
+        return extract_video_info_ytdlp(url)
+    
+    except Exception as e:
+        logger.error(f"Erreur extraction: {str(e)}")
+        raise Exception(f"Impossible d'extraire cette vidéo: {str(e)[:100]}")
+
+def extract_video_info_ytdlp(url):
+    """Extraction pure yt-dlp (fallback)"""
     try:
         ydl_opts = {
             'quiet': True,
@@ -64,36 +264,12 @@ def extract_video_info(url):
             'extract_flat': False,
             'socket_timeout': 30,
             'nocheckcertificate': True,
-            'ignoreerrors': False,
-            'no_color': True,
-            # Options avancées pour éviter le blocage
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             },
-            # Options YouTube spécifiques
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                    'skip': ['hls', 'dash'],
-                }
-            },
-            # Éviter les vérifications lourdes
-            'skip_download': True,
-            'no_check_certificate': True,
-            # Format simple pour extraction rapide
-            'format': 'best/bestvideo+bestaudio',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info(f"Tentative d'extraction: {url}")
-            
-            # Tentative d'extraction
             info = ydl.extract_info(url, download=False)
             
             if not info:
@@ -101,143 +277,105 @@ def extract_video_info(url):
             
             videos = []
             
-            # Si c'est une playlist
             if 'entries' in info:
-                logger.info(f"Playlist détectée avec {len(info['entries'])} entrées")
                 for entry in info['entries']:
                     if entry:
-                        video = format_video_info(entry)
+                        video = format_video_info_ytdlp(entry)
                         if video:
                             videos.append(video)
             else:
-                # Vidéo unique
-                logger.info(f"Vidéo unique détectée: {info.get('title', 'Sans titre')}")
-                video = format_video_info(info)
+                video = format_video_info_ytdlp(info)
                 if video:
                     videos.append(video)
             
-            logger.info(f"Extraction réussie: {len(videos)} vidéo(s)")
             return videos
-            
+    
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        logger.error(f"Erreur yt-dlp DownloadError: {error_msg}")
-        
-        # Messages d'erreur plus spécifiques
-        if "Video unavailable" in error_msg or "This video is unavailable" in error_msg:
-            raise Exception("Cette vidéo n'est pas disponible (privée ou supprimée)")
-        elif "age" in error_msg.lower() or "Sign in to confirm your age" in error_msg:
-            raise Exception("Cette vidéo est protégée par âge")
-        elif "copyright" in error_msg.lower():
-            raise Exception("Cette vidéo est protégée par des droits d'auteur")
-        elif "Private video" in error_msg:
-            raise Exception("Cette vidéo est privée")
-        elif "bot" in error_msg.lower() or "Sign in to confirm" in error_msg:
-            # Message spécial pour anti-bot avec conseil
-            raise Exception("Extraction temporairement bloquée par YouTube. Veuillez réessayer dans 5-10 minutes. Astuce: Les vidéos populaires et récentes fonctionnent mieux.")
+        if "bot" in error_msg.lower() or "Sign in" in error_msg:
+            raise Exception("YouTube a bloqué la requête. Utilisez des vidéos populaires et anciennes, ou réessayez dans quelques minutes.")
         else:
             raise Exception(f"Erreur d'extraction: {error_msg[:200]}")
-            
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Erreur extraction générale: {error_msg}")
-        
-        if "Aucune information extraite" in error_msg:
-            raise Exception("Impossible d'extraire cette vidéo. Vérifiez l'URL.")
-        else:
-            raise Exception(f"Erreur: {error_msg[:200]}")
 
-def format_video_info(info):
-    """Formate les informations vidéo"""
+def format_video_info_ytdlp(info):
+    """Formate les infos vidéo depuis yt-dlp"""
     try:
-        video_id = info.get('id', '')
-        
-        # Obtenir les formats disponibles
-        formats = []
-        if 'formats' in info:
-            for fmt in info['formats']:
-                # Accepter les formats vidéo et audio
-                ext = fmt.get('ext', '')
-                vcodec = fmt.get('vcodec', 'none')
-                acodec = fmt.get('acodec', 'none')
-                
-                # Filtrer: doit avoir vidéo OU audio (pas "none")
-                if vcodec == 'none' and acodec == 'none':
-                    continue
-                
-                # Accepter plus d'extensions
-                if ext not in ['mp4', 'webm', '3gp', 'm4a', 'mkv']:
-                    continue
-                
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
-                
-                # Vérifier la taille maximale (seulement si connue)
-                if filesize > MAX_VIDEO_SIZE:
-                    continue
-                
-                # Déterminer la qualité
-                quality = fmt.get('format_note', '')
-                if not quality or quality == 'N/A':
-                    # Essayer height (résolution verticale)
-                    height = fmt.get('height')
-                    if height:
-                        quality = f"{height}p"
-                    else:
-                        # Essayer resolution complète
-                        quality = fmt.get('resolution', 'unknown')
-                
-                format_info = {
-                    'quality': quality,
-                    'size': format_size(filesize) if filesize > 0 else 'Unknown',
-                    'codec': ext.upper(),
-                    'url': fmt.get('url', ''),
-                    'format_id': fmt.get('format_id', ''),
-                    'filesize': filesize
-                }
-                
-                formats.append(format_info)
-        
-        # Si aucun format trouvé, utiliser le format par défaut
-        if not formats and 'url' in info:
-            formats.append({
-                'quality': 'best',
-                'size': 'Unknown',
-                'codec': info.get('ext', 'MP4').upper(),
-                'url': info.get('url', ''),
-                'format_id': 'best',
-                'filesize': 0
-            })
-        
-        # Filtrer les doublons et trier
-        unique_formats = {}
-        for fmt in formats:
-            key = f"{fmt['quality']}-{fmt['codec']}"
-            # Garder celui avec la plus grande taille (ou le premier si taille inconnue)
-            if key not in unique_formats:
-                unique_formats[key] = fmt
-            elif fmt['filesize'] > 0 and (unique_formats[key]['filesize'] == 0 or fmt['filesize'] > unique_formats[key]['filesize']):
-                unique_formats[key] = fmt
-        
-        # Limiter à 10 formats maximum et trier par taille
-        sorted_formats = sorted(
-            unique_formats.values(),
-            key=lambda x: x['filesize'] if x['filesize'] > 0 else 0,
-            reverse=True
-        )[:10]
+        formats = get_formats_from_ytdlp_info(info)
         
         return {
-            'id': video_id,
+            'id': info.get('id', ''),
             'title': info.get('title', 'Sans titre'),
             'thumbnail': info.get('thumbnail', ''),
             'duration': info.get('duration', 0),
-            'formats': sorted_formats
+            'formats': formats,
+            'from_api': False
         }
     except Exception as e:
-        logger.error(f"Erreur formatage vidéo: {str(e)}")
+        logger.error(f"Erreur formatage: {str(e)}")
         return None
 
+def get_formats_from_ytdlp_info(info):
+    """Extrait les formats depuis l'info yt-dlp"""
+    formats = []
+    
+    if 'formats' in info:
+        for fmt in info['formats']:
+            ext = fmt.get('ext', '')
+            vcodec = fmt.get('vcodec', 'none')
+            acodec = fmt.get('acodec', 'none')
+            
+            if vcodec == 'none' and acodec == 'none':
+                continue
+            
+            if ext not in ['mp4', 'webm', '3gp', 'm4a', 'mkv']:
+                continue
+            
+            filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
+            
+            if filesize > MAX_VIDEO_SIZE:
+                continue
+            
+            height = fmt.get('height')
+            quality = f"{height}p" if height else fmt.get('format_note', 'unknown')
+            
+            formats.append({
+                'quality': quality,
+                'size': format_size(filesize) if filesize > 0 else 'Unknown',
+                'codec': ext.upper(),
+                'url': fmt.get('url', ''),
+                'format_id': fmt.get('format_id', ''),
+                'filesize': filesize
+            })
+    
+    # Dédupliquer et trier
+    unique_formats = {}
+    for fmt in formats:
+        key = f"{fmt['quality']}-{fmt['codec']}"
+        if key not in unique_formats:
+            unique_formats[key] = fmt
+        elif fmt['filesize'] > 0 and (unique_formats[key]['filesize'] == 0 or fmt['filesize'] > unique_formats[key]['filesize']):
+            unique_formats[key] = fmt
+    
+    sorted_formats = sorted(
+        unique_formats.values(),
+        key=lambda x: x['filesize'] if x['filesize'] > 0 else 0,
+        reverse=True
+    )[:10]
+    
+    if not sorted_formats:
+        sorted_formats = [{
+            'quality': 'best',
+            'size': 'Unknown',
+            'codec': 'MP4',
+            'url': info.get('url', ''),
+            'format_id': 'best',
+            'filesize': 0
+        }]
+    
+    return sorted_formats
+
 def format_size(bytes_size):
-    """Formate la taille en octets vers une chaîne lisible"""
+    """Formate la taille en octets"""
     if bytes_size == 0:
         return "N/A"
     
@@ -250,22 +388,29 @@ def format_size(bytes_size):
 @app.route('/', methods=['GET'])
 def index():
     """Page d'accueil de l'API"""
+    api_status = "✅ Configurée" if YOUTUBE_API_KEY else "❌ Non configurée"
+    
     return jsonify({
         'service': 'video-extractor-api',
-        'version': '2.1.0',
+        'version': '3.0.0',
         'status': 'running',
+        'youtube_api': api_status,
         'endpoints': {
             'health': '/api/health',
             'extract': '/api/extract (POST)',
             'download': '/api/download (POST)'
         },
-        'note': 'En raison des protections anti-bot de YouTube, certaines vidéos peuvent échouer. Réessayez dans quelques minutes.'
+        'features': [
+            'API YouTube officielle pour métadonnées (fiable)',
+            'yt-dlp pour liens de téléchargement',
+            'Mode hybride intelligent',
+            '10,000 vidéos/jour avec API YouTube'
+        ]
     })
 
 @app.route('/api/extract', methods=['POST'])
 def extract():
     """Endpoint pour extraire les informations vidéo"""
-    # Rate limiting
     client_ip = request.remote_addr
     if not rate_limit_check(client_ip):
         return jsonify({'error': 'Trop de requêtes. Veuillez patienter.'}), 429
@@ -279,7 +424,6 @@ def extract():
     if not url:
         return jsonify({'error': 'URL requise'}), 400
     
-    # Valider l'URL
     is_valid, error_msg = validate_url(url)
     if not is_valid:
         return jsonify({'error': error_msg}), 400
@@ -291,7 +435,8 @@ def extract():
             return jsonify({
                 'success': True,
                 'videos': videos,
-                'count': len(videos)
+                'count': len(videos),
+                'method': 'youtube_api' if videos[0].get('from_api') else 'yt-dlp'
             })
         else:
             return jsonify({'error': 'Aucune vidéo trouvée'}), 404
@@ -302,8 +447,7 @@ def extract():
 
 @app.route('/api/download', methods=['POST'])
 def download_video():
-    """Endpoint pour télécharger une vidéo avec streaming"""
-    # Rate limiting
+    """Endpoint pour télécharger une vidéo"""
     client_ip = request.remote_addr
     if not rate_limit_check(client_ip):
         return jsonify({'error': 'Trop de requêtes. Veuillez patienter.'}), 429
@@ -319,17 +463,14 @@ def download_video():
     if not url:
         return jsonify({'error': 'URL requise'}), 400
     
-    # Valider l'URL
     is_valid, error_msg = validate_url(url)
     if not is_valid:
         return jsonify({'error': error_msg}), 400
     
     try:
-        # Nettoyer le titre pour le nom de fichier
         safe_title = re.sub(r'[^\w\s-]', '', title)
         safe_title = re.sub(r'[-\s]+', '_', safe_title)[:100]
         
-        # Options pour yt-dlp
         ydl_opts = {
             'format': format_id if format_id else 'best',
             'quiet': True,
@@ -337,7 +478,6 @@ def download_video():
             'socket_timeout': 30,
         }
         
-        # Créer un répertoire temporaire
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts['outtmpl'] = os.path.join(tmpdir, f'{safe_title}.%(ext)s')
             
@@ -346,7 +486,6 @@ def download_video():
                     info = ydl.extract_info(url, download=True)
                     filename = ydl.prepare_filename(info)
                     
-                    # Si le fichier a une extension différente, chercher le fichier téléchargé
                     if not os.path.exists(filename):
                         for file in os.listdir(tmpdir):
                             if file.startswith(safe_title):
@@ -354,14 +493,12 @@ def download_video():
                                 break
                     
                     if not os.path.exists(filename):
-                        return jsonify({'error': 'Fichier non trouvé après téléchargement'}), 404
+                        return jsonify({'error': 'Fichier non trouvé'}), 404
                     
-                    # Vérifier la taille du fichier
                     file_size = os.path.getsize(filename)
                     if file_size > MAX_VIDEO_SIZE:
                         return jsonify({'error': f'Fichier trop volumineux (max {MAX_VIDEO_SIZE // (1024*1024)} MB)'}), 413
                     
-                    # Streaming du fichier
                     def generate():
                         with open(filename, 'rb') as f:
                             while True:
@@ -370,7 +507,6 @@ def download_video():
                                     break
                                 yield chunk
                     
-                    # Déterminer le type MIME
                     ext = info.get('ext', 'mp4')
                     mime_types = {
                         'mp4': 'video/mp4',
@@ -401,13 +537,13 @@ def download_video():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Endpoint de vérification de santé de l'API"""
+    """Endpoint de vérification de santé"""
     return jsonify({
         'status': 'healthy',
         'service': 'video-extractor-api',
-        'version': '2.1.0',
-        'max_video_size_mb': MAX_VIDEO_SIZE // (1024 * 1024),
-        'note': 'YouTube peut bloquer certaines requêtes avec des protections anti-bot'
+        'version': '3.0.0',
+        'youtube_api_configured': bool(YOUTUBE_API_KEY),
+        'max_video_size_mb': MAX_VIDEO_SIZE // (1024 * 1024)
     })
 
 @app.errorhandler(404)
@@ -420,4 +556,9 @@ def internal_error(error):
     return jsonify({'error': 'Erreur interne du serveur'}), 500
 
 if __name__ == '__main__':
+    if not YOUTUBE_API_KEY:
+        logger.warning("⚠️ YOUTUBE_API_KEY non configurée. Fonctionnement en mode yt-dlp uniquement.")
+    else:
+        logger.info("✅ YouTube API configurée et prête")
+    
     app.run(host='0.0.0.0', port=5000, debug=False)
