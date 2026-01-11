@@ -28,7 +28,7 @@ def validate_url(url):
         if not parsed.scheme in ['http', 'https']:
             return False, "Protocole non autorisé"
         
-        domain = parsed.netloc.replace('www.', '')
+        domain = parsed.netloc.replace('www.', '').replace('m.', '')
         if not any(allowed in domain for allowed in ALLOWED_DOMAINS):
             return False, f"Domaine non autorisé. Domaines acceptés: {', '.join(ALLOWED_DOMAINS)}"
         
@@ -59,16 +59,14 @@ def extract_video_info(url):
     """Extrait les informations vidéo d'une URL"""
     try:
         ydl_opts = {
-            'quiet': False,
-            'no_warnings': False,
+            'quiet': True,
+            'no_warnings': True,
             'extract_flat': False,
-            'force_generic_extractor': False,
             'socket_timeout': 30,
-            'format': 'best',
             'nocheckcertificate': True,
             'ignoreerrors': False,
             'no_color': True,
-            # Headers pour éviter le blocage anti-bot
+            # Options avancées pour éviter le blocage
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -78,10 +76,24 @@ def extract_video_info(url):
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
             },
+            # Options YouTube spécifiques
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                    'skip': ['hls', 'dash'],
+                }
+            },
+            # Éviter les vérifications lourdes
+            'skip_download': True,
+            'no_check_certificate': True,
+            # Format simple pour extraction rapide
+            'format': 'best/bestvideo+bestaudio',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Tentative d'extraction: {url}")
+            
+            # Tentative d'extraction
             info = ydl.extract_info(url, download=False)
             
             if not info:
@@ -106,6 +118,7 @@ def extract_video_info(url):
             
             logger.info(f"Extraction réussie: {len(videos)} vidéo(s)")
             return videos
+            
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
         logger.error(f"Erreur yt-dlp DownloadError: {error_msg}")
@@ -114,24 +127,25 @@ def extract_video_info(url):
         if "Video unavailable" in error_msg or "This video is unavailable" in error_msg:
             raise Exception("Cette vidéo n'est pas disponible (privée ou supprimée)")
         elif "age" in error_msg.lower() or "Sign in to confirm your age" in error_msg:
-            raise Exception("Cette vidéo est protégée par âge et ne peut pas être extraite")
+            raise Exception("Cette vidéo est protégée par âge")
         elif "copyright" in error_msg.lower():
             raise Exception("Cette vidéo est protégée par des droits d'auteur")
         elif "Private video" in error_msg:
             raise Exception("Cette vidéo est privée")
         elif "bot" in error_msg.lower() or "Sign in to confirm" in error_msg:
-            raise Exception("YouTube a détecté un accès automatisé. Réessayez dans quelques minutes ou utilisez une autre vidéo.")
+            # Message spécial pour anti-bot avec conseil
+            raise Exception("Extraction temporairement bloquée par YouTube. Veuillez réessayer dans 5-10 minutes. Astuce: Les vidéos populaires et récentes fonctionnent mieux.")
         else:
-            raise Exception(f"Impossible d'extraire cette vidéo: {error_msg}")
+            raise Exception(f"Erreur d'extraction: {error_msg[:200]}")
+            
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Erreur extraction générale: {error_msg}")
         
-        # Ne pas exposer les détails techniques au client
         if "Aucune information extraite" in error_msg:
             raise Exception("Impossible d'extraire cette vidéo. Vérifiez l'URL.")
         else:
-            raise Exception(f"Erreur lors de l'extraction: {error_msg}")
+            raise Exception(f"Erreur: {error_msg[:200]}")
 
 def format_video_info(info):
     """Formate les informations vidéo"""
@@ -183,19 +197,16 @@ def format_video_info(info):
                 
                 formats.append(format_info)
         
-        # Si aucun format trouvé, logger pour debug
-        if not formats:
-            logger.warning(f"Aucun format trouvé pour la vidéo {video_id}")
-            # Essayer d'obtenir le format "best" par défaut
-            if 'url' in info:
-                formats.append({
-                    'quality': 'best',
-                    'size': 'Unknown',
-                    'codec': info.get('ext', 'MP4').upper(),
-                    'url': info.get('url', ''),
-                    'format_id': 'best',
-                    'filesize': 0
-                })
+        # Si aucun format trouvé, utiliser le format par défaut
+        if not formats and 'url' in info:
+            formats.append({
+                'quality': 'best',
+                'size': 'Unknown',
+                'codec': info.get('ext', 'MP4').upper(),
+                'url': info.get('url', ''),
+                'format_id': 'best',
+                'filesize': 0
+            })
         
         # Filtrer les doublons et trier
         unique_formats = {}
@@ -235,6 +246,21 @@ def format_size(bytes_size):
             return f"{bytes_size:.1f} {unit}"
         bytes_size /= 1024.0
     return f"{bytes_size:.1f} TB"
+
+@app.route('/', methods=['GET'])
+def index():
+    """Page d'accueil de l'API"""
+    return jsonify({
+        'service': 'video-extractor-api',
+        'version': '2.1.0',
+        'status': 'running',
+        'endpoints': {
+            'health': '/api/health',
+            'extract': '/api/extract (POST)',
+            'download': '/api/download (POST)'
+        },
+        'note': 'En raison des protections anti-bot de YouTube, certaines vidéos peuvent échouer. Réessayez dans quelques minutes.'
+    })
 
 @app.route('/api/extract', methods=['POST'])
 def extract():
@@ -301,7 +327,7 @@ def download_video():
     try:
         # Nettoyer le titre pour le nom de fichier
         safe_title = re.sub(r'[^\w\s-]', '', title)
-        safe_title = re.sub(r'[-\s]+', '_', safe_title)[:100]  # Limiter à 100 caractères
+        safe_title = re.sub(r'[-\s]+', '_', safe_title)[:100]
         
         # Options pour yt-dlp
         ydl_opts = {
@@ -339,7 +365,7 @@ def download_video():
                     def generate():
                         with open(filename, 'rb') as f:
                             while True:
-                                chunk = f.read(4096)  # Lire par chunks de 4KB
+                                chunk = f.read(4096)
                                 if not chunk:
                                     break
                                 yield chunk
@@ -373,29 +399,15 @@ def download_video():
         logger.error(f"Erreur API download: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/', methods=['GET'])
-def index():
-    """Page d'accueil de l'API"""
-    return jsonify({
-        'service': 'video-extractor-api',
-        'version': '2.0.0',
-        'status': 'running',
-        'endpoints': {
-            'health': '/api/health',
-            'extract': '/api/extract (POST)',
-            'download': '/api/download (POST)'
-        },
-        'documentation': 'https://github.com/votre-repo'
-    })
-
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Endpoint de vérification de santé de l'API"""
     return jsonify({
         'status': 'healthy',
         'service': 'video-extractor-api',
-        'version': '2.0.0',
-        'max_video_size_mb': MAX_VIDEO_SIZE // (1024 * 1024)
+        'version': '2.1.0',
+        'max_video_size_mb': MAX_VIDEO_SIZE // (1024 * 1024),
+        'note': 'YouTube peut bloquer certaines requêtes avec des protections anti-bot'
     })
 
 @app.errorhandler(404)
